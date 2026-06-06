@@ -12,6 +12,9 @@ from .const import (
     DEFAULT_SCAN_INTERVAL,
     DOMAIN,
     CONF_FAST_ENABLED,
+    CONF_MODEL,
+    INTEGRATION_MODELS,
+    DEFAULT_MODEL,
 )
 from .utils import get_config_value
 
@@ -31,6 +34,7 @@ DATA_SCHEMA = vol.Schema(
         vol.Optional(CONF_NAME, default=DEFAULT_NAME): str,
         vol.Required(CONF_HOST): str,
         vol.Required(CONF_PORT, default=DEFAULT_PORT): int,
+        vol.Required(CONF_MODEL, default=DEFAULT_MODEL): vol.In(INTEGRATION_MODELS),
         vol.Optional(CONF_SCAN_INTERVAL, default=DEFAULT_SCAN_INTERVAL): vol.All(
             vol.Coerce(int), vol.Range(min=60, msg="invalid_scan_interval")
         ),
@@ -206,6 +210,10 @@ class SAJModbusOptionsFlowHandler(config_entries.OptionsFlowWithConfigEntry):
             {
                 vol.Required(CONF_HOST, default=host_default): str,
                 vol.Required(CONF_PORT, default=port_default): int,
+                vol.Required(
+                        CONF_MODEL, 
+                        default=self.config_entry.options.get(CONF_MODEL, self.config_entry.data.get(CONF_MODEL, DEFAULT_MODEL))
+                    ): vol.In(INTEGRATION_MODELS),
                 vol.Optional(CONF_SCAN_INTERVAL, default=scan_default): vol.All(
                     vol.Coerce(int), vol.Range(min=60, msg="invalid_scan_interval")
                 ),

@@ -42,6 +42,13 @@ CONF_USE_HA_MQTT = "use_ha_mqtt"
 DEFAULT_MQTT_PORT = 1883
 DEFAULT_MQTT_TOPIC_PREFIX = "saj"
 
+# Constantes para soporte multimodelo (H1 / H2)
+CONF_MODEL = "model"
+MODEL_H1 = "H1"
+MODEL_H2 = "H2"
+INTEGRATION_MODELS = [MODEL_H1, MODEL_H2]
+DEFAULT_MODEL = MODEL_H2
+
 # Single source of truth for configuration defaults used by hub.__init__ and
 # async_update_options.  Pass directly to get_config_values(); it is read-only.
 DEFAULT_CONFIG_SCHEMA: dict[str, Any] = {
@@ -57,6 +64,7 @@ DEFAULT_CONFIG_SCHEMA: dict[str, Any] = {
     CONF_MQTT_TOPIC_PREFIX: DEFAULT_MQTT_TOPIC_PREFIX,
     CONF_MQTT_PUBLISH_ALL: False,
     CONF_USE_HA_MQTT: False,
+    CONF_MODEL: DEFAULT_MODEL,
 }
 
 

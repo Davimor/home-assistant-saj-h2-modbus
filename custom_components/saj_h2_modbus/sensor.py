@@ -9,7 +9,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.components.sensor import SensorEntity
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import DOMAIN, SENSOR_TYPES, SajModbusSensorEntityDescription
+from .const import DOMAIN, SENSOR_TYPES, SajModbusSensorEntityDescription, MODEL_H1
 from .hub import SAJModbusHub, FAST_POLL_SENSORS, ADVANCED_LOGGING
 
 _LOGGER = logging.getLogger(__name__)
@@ -22,8 +22,35 @@ async def async_setup_entry(
     hub: SAJModbusHub = hass.data[DOMAIN][entry.entry_id]["hub"]
     device_info = hass.data[DOMAIN][entry.entry_id]["device_info"]
 
+    # Determinar si el modelo es un H1 para filtrar sensores incompatibles de celdas de batería (bloque 3_2)
+    is_h1 = getattr(hub, "model", None) == MODEL_H1
+
+    # Generamos de forma robusta la lista de claves exclusivas de H2 (celdas individuales de batería y temperaturas)
+    # Soporta formatos de nombre 'battery_cell_1_voltage', 'cell_voltage_01' y rangos habituales de hasta 20 celdas
+    h2_exclusive_keys = (
+        [f"battery_cell_{i}_voltage" for i in range(1, 21)]
+        + [f"battery_cell_{i}_temp" for i in range(1, 11)]
+        + [f"cell_voltage_{i:02d}" for i in range(1, 21)]
+        + [f"cell_temp_{i:02d}" for i in range(1, 11)]
+        + [
+            "battery_cell_voltage_max",
+            "battery_cell_voltage_min",
+            "battery_cell_temp_max",
+            "battery_cell_temp_min",
+        ]
+    )
+
     entities = []
     for description in SENSOR_TYPES.values():
+        # FILTRO CRÍTICO: Si es un H1 y el sensor pertenece al conjunto exclusivo de H2, lo ignoramos silenciosamente
+        if is_h1 and description.key in h2_exclusive_keys:
+            if ADVANCED_LOGGING:
+                _LOGGER.debug(
+                    "Omitiendo la entidad exclusiva de H2 '%s' en inversor H1",
+                    description.key,
+                )
+            continue
+
         if description.key in FAST_POLL_SENSORS:
             # Create BOTH entities for fast-poll sensors:
             # 1. Normal entity (60s, with DB recording)
