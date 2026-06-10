@@ -24,10 +24,10 @@ from .const import (
     CONF_MQTT_PUBLISH_ALL,
     CONF_USE_HA_MQTT,
     DEFAULT_CONFIG_SCHEMA,
-    CONF_MODEL,        # NUEVO: Soportar H1 / H2
-    MODEL_H1,          # NUEVO
-    MODEL_H2,          # NUEVO
-    DEFAULT_MODEL,     # NUEVO
+    CONF_MODEL,        # new: support H1 / H2
+    MODEL_H1,          # new
+    MODEL_H2,          # new
+    DEFAULT_MODEL,     # new
 )
 from . import modbus_readers
 from .modbus_utils import (
@@ -72,6 +72,10 @@ FAST_POLL_SENSORS = {
     "TotalInvPowerVA",
     "BackupTotalLoadPowerWatt",
     "BackupTotalLoadPowerVA",
+    # pv1Power/pv2Power come from read_additional_modbus_data_1_part_1.
+    # That function is read in the 10 s fast loop (non-ultra) but NOT in the
+    # 1 s ultra-fast loop (which only reads part_2). These keys therefore
+    # update at 10 s in fast mode and at 60 s in ultra-fast mode.
     "pv1Power",
     "pv2Power",
 }
@@ -89,6 +93,7 @@ _LOCK_ORDER = {
 _LOCK_STACK: ContextVar[tuple[str, ...]] = ContextVar("saj_lock_stack", default=())
 
 # All reader groups executed sequentially in the 60 s slow poll.
+# Defined once at module level to avoid re-creating the list on every cycle (F16).
 _READER_GROUPS = [
     [modbus_readers.read_modbus_realtime_data],
     [
@@ -136,9 +141,8 @@ class SAJModbusHub(DataUpdateCoordinator[dict[str, Any]]):
             update_interval=timedelta(seconds=scan_interval),
             update_method=self._async_update_data,
         )
-
-        # NUEVO: Guardar el modelo configurado (H1 o H2).
-        # Implementa extracción robusta desde config y fallback al entry data/options.
+        
+        # New: save configured model (H1 o H2).
         self.model = config.get(CONF_MODEL) or config_entry.data.get(CONF_MODEL, DEFAULT_MODEL)
 
         # Robust config loading (options priority, then data)
@@ -155,12 +159,13 @@ class SAJModbusHub(DataUpdateCoordinator[dict[str, Any]]):
         use_ha_mqtt = config[CONF_USE_HA_MQTT]
 
         _LOGGER.info(
-            "SAJ Hub Initialized. Host: %s, Model: %s, Fast: %s, Ultra: %s, MQTT Prefix: '%s'",
+            "SAJ Hub Initialized. Host: %s, Model: %s, Fast: %s, Ultra: %s, MQTT Prefix: '%s', MQTT Host: '%s'",
             host,
             self.model,
             self.fast_enabled,
             self.ultra_fast_enabled,
             mqtt_topic_prefix,
+            mqtt_host,
         )
 
         # --- SERVICES ---
@@ -186,6 +191,9 @@ class SAJModbusHub(DataUpdateCoordinator[dict[str, Any]]):
 
     def _init_locks(self) -> None:
         """Initialise all asyncio locks and synchronisation primitives."""
+        # PERFORMANCE OPTIMIZATION: Separate locks for different polling intervals
+        # to reduce contention between ultra-fast (1s), fast (10s) and slow (60s) loops.
+        # Single lock for all reads because reader groups execute sequentially
         self._read_lock = asyncio.Lock()
 
         # Merge locks for shared state/mask registers
@@ -195,6 +203,7 @@ class SAJModbusHub(DataUpdateCoordinator[dict[str, Any]]):
         }
 
         # Read-modify-write locks for non-merge-locked registers.
+        # OrderedDict enables LRU eviction: oldest (front) entry is dropped first.
         self._rmw_locks: OrderedDict[int, asyncio.Lock] = OrderedDict()
         self._rmw_locks_last_access: dict[int, float] = {}
         self._rmw_lock_ttl: float = 3600.0  # 1 hour TTL
@@ -215,8 +224,8 @@ class SAJModbusHub(DataUpdateCoordinator[dict[str, Any]]):
         self._fast_unsub = None
         self._cancel_fast_update = None
         self._cancel_ultra_fast_update = None
-        self._pending_fast_start_cancel = None
-        self._pending_ultra_fast_start_cancel = None
+        self._pending_fast_start_cancel: Callable | None = None
+        self._pending_ultra_fast_start_cancel: Callable | None = None
         self._cache_cleanup_unsub = None
         self._fast_listeners: set[Callable[[], None]] = set()
         self._fast_poll_sensor_keys = FAST_POLL_SENSORS
@@ -308,6 +317,8 @@ class SAJModbusHub(DataUpdateCoordinator[dict[str, Any]]):
 
     async def _run_reader_methods(self, client: Any) -> dict[str, Any]:
         """Executes all readers using the provided client with H1 dynamic filtering."""
+        # Activate the per-instance circuit breaker for the entire read session.
+        # All downstream try_read_registers() calls pick this up via the ContextVar.
         cb_token = _CIRCUIT_BREAKER_CTX.set(self.connection.circuit_breaker)
         try:
             new_cache: dict[str, Any] = {}
@@ -336,11 +347,12 @@ class SAJModbusHub(DataUpdateCoordinator[dict[str, Any]]):
 
             for group in _READER_GROUPS:
                 for method in group:
-                    # NUEVO FILTRO CRÍTICO: Si es un H1, ignoramos dinámicamente la llamada al bloque 3_2
+                    
+                    # new filter: if H1 ignore read_additional_modbus_data_3_2
                     if self.model == MODEL_H1 and method.__name__ == "read_additional_modbus_data_3_2":
                         _LOGGER.debug("Omitiendo lectura de %s (Incompatible con H1)", method.__name__)
                         continue
-
+                    
                     try:
                         res = await method(client, self._read_lock)
                         if isinstance(res, dict):
@@ -408,6 +420,7 @@ class SAJModbusHub(DataUpdateCoordinator[dict[str, Any]]):
             else "_pending_fast_start_cancel"
         )
 
+        # Replace any existing pending handle for the same loop
         pending_handle = getattr(self, pending_attr, None)
         if pending_handle:
             pending_handle()
@@ -424,6 +437,7 @@ class SAJModbusHub(DataUpdateCoordinator[dict[str, Any]]):
 
     async def start_fast_updates(self) -> None:
         """Start fast update loops based on configuration."""
+        # Start the 10s Fast Loop only when Ultra is disabled
         if self.fast_enabled and not self.ultra_fast_enabled:
             if self._cancel_fast_update:
                 self._cancel_fast_update()
@@ -443,6 +457,7 @@ class SAJModbusHub(DataUpdateCoordinator[dict[str, Any]]):
                 self._pending_fast_start_cancel()
                 self._pending_fast_start_cancel = None
 
+        # Start the 1s Ultra Loop independently if enabled
         if self.ultra_fast_enabled:
             if self._cancel_ultra_fast_update:
                 self._cancel_ultra_fast_update()
@@ -458,7 +473,13 @@ class SAJModbusHub(DataUpdateCoordinator[dict[str, Any]]):
     async def _run_fast_modbus_read(
         self, client: Any, lock: asyncio.Lock, ultra: bool
     ) -> dict[str, Any] | None:
-        """Execute Modbus read with one-shot retry for fast poll cycle."""
+        """Execute Modbus read with one-shot retry for fast poll cycle.
+
+        Returns the raw result dict, an empty dict if the device returned
+        nothing, or None if both the initial attempt and the retry failed
+        (already logged; caller should skip the update cycle).
+        ReconnectionNeededError is always re-raised for hub-level handling.
+        """
         try:
             if ultra:
                 return await modbus_readers.read_additional_modbus_data_1_part_2(
@@ -500,15 +521,28 @@ class SAJModbusHub(DataUpdateCoordinator[dict[str, Any]]):
         await self.mqtt.publish_data(fast_data)
 
     def _notify_fast_listeners(self) -> None:
-        """Notify HA entity listeners about updated fast-poll sensor data."""
+        """Notify HA entity listeners about updated fast-poll sensor data.
+
+        Only called from the 10 s loop – not from ultra-fast (1 s) mode –
+        to avoid flooding the HA recorder database.
+        """
         for listener in tuple(self._fast_listeners):
             listener()
 
     async def _async_update_fast(self, now=None, ultra: bool = False) -> None:
-        """Perform fast update of sensor data with performance optimizations."""
+        """Perform fast update of sensor data with performance optimizations.
+
+        PERFORMANCE OPTIMIZATIONS:
+        1. Separate locks for ultra fast vs fast modes - reduces lock contention
+        2. Skip ultra-fast update if write operation is in progress
+        """
         if not self.fast_enabled and not ultra:
             return
 
+        # Immediately skip ultra-fast update if a write operation is in progress.
+        # No wait: the write may take longer than the 1s poll interval, and
+        # blocking here would throw off the entire ultra-fast schedule.
+        # The pending flag ensures a catch-up update is triggered after the write.
         if ultra and not self._write_done.is_set():
             self._ultra_fast_pending = True
             _LOGGER.debug("Skipping ultra-fast update - write operation in progress")
@@ -517,6 +551,8 @@ class SAJModbusHub(DataUpdateCoordinator[dict[str, Any]]):
         try:
             client = await self.connection.get_client()
 
+            # TOCTOU guard: a write may have started while we awaited get_client().
+            # Re-check _write_done before touching the Modbus socket.
             if ultra and not self._write_done.is_set():
                 self._ultra_fast_pending = True
                 _LOGGER.debug(
@@ -524,15 +560,17 @@ class SAJModbusHub(DataUpdateCoordinator[dict[str, Any]]):
                 )
                 return
 
+            # PERFORMANCE OPTIMIZATION: Use dedicated single lock for all reads.
             lock = self._read_lock
             lock_name = "fast_read"
 
+            # Activate per-instance circuit breaker for this fast-poll read session.
             cb_token = _CIRCUIT_BREAKER_CTX.set(self.connection.circuit_breaker)
             try:
                 async with self._lock_order_guard(lock_name):
                     result = await self._run_fast_modbus_read(client, lock, ultra)
                     if result is None:
-                        return
+                        return  # both attempts failed, already logged
 
                     if not result:
                         _LOGGER.warning(
@@ -558,6 +596,7 @@ class SAJModbusHub(DataUpdateCoordinator[dict[str, Any]]):
 
                     await self._publish_fast_mqtt(fast_data)
 
+                    # Only the 10s loop should push to HA entities to avoid DB spam.
                     if not ultra:
                         self._notify_fast_listeners()
             finally:
@@ -598,7 +637,7 @@ class SAJModbusHub(DataUpdateCoordinator[dict[str, Any]]):
         mqtt_publish_all: bool = False,
         use_ha_mqtt: bool = False,
     ) -> None:
-        """Update connection settings. Full signature restored."""
+        """Update connection settings. Full signature restored to support positional arguments."""
         if self.updating_settings:
             return
         self.updating_settings = True
@@ -606,6 +645,8 @@ class SAJModbusHub(DataUpdateCoordinator[dict[str, Any]]):
             # Update Services
             self.connection.update_config(host, port)
 
+            # Restart cache-cleanup timer so it fires relative to the new config change,
+            # not from whenever the integration was first set up.
             if self._cache_cleanup_unsub:
                 self._cache_cleanup_unsub()
             self._cache_cleanup_unsub = async_track_time_interval(
@@ -614,13 +655,15 @@ class SAJModbusHub(DataUpdateCoordinator[dict[str, Any]]):
                 timedelta(seconds=300),
             )
 
+            # FAILSAFE: If prefix argument is None (because __init__.py didn't pass it),
+            # retrieve it from the ConfigEntry options/data directly.
             if mqtt_topic_prefix is None:
                 mqtt_topic_prefix = self._config_entry.options.get(
                     CONF_MQTT_TOPIC_PREFIX,
                     self._config_entry.data.get(CONF_MQTT_TOPIC_PREFIX, "saj"),
                 )
 
-            # Update MQTT
+            # Update MQTT: pass explicit values from args (or recovered value)
             self.mqtt.update_config(
                 mqtt_host,
                 mqtt_port,
@@ -650,6 +693,8 @@ class SAJModbusHub(DataUpdateCoordinator[dict[str, Any]]):
                     "Updating scan interval: %s -> %ss", old_seconds, int(scan_interval)
                 )
 
+                # DataUpdateCoordinator does not guarantee automatic rescheduling when
+                # update_interval changes. Reschedule explicitly so Options changes take effect.
                 try:
                     unsub = getattr(self, "_unsub_refresh", None)
                     if unsub:
@@ -666,11 +711,14 @@ class SAJModbusHub(DataUpdateCoordinator[dict[str, Any]]):
             self.ultra_fast_enabled = ultra_fast_enabled
             self.use_ha_mqtt = use_ha_mqtt
 
+            # Restart Fast Loop (Stop everything first, then restart based on flags)
             self._cleanup_fast_update_callbacks()
 
+            # Start loops independently based on flags
             if self.fast_enabled or self.ultra_fast_enabled:
                 await self.start_fast_updates()
 
+            # Apply config changes immediately (and prime next refresh scheduling)
             await self.async_request_refresh()
 
         finally:
@@ -687,6 +735,7 @@ class SAJModbusHub(DataUpdateCoordinator[dict[str, Any]]):
         if self._pending_ultra_fast_start_cancel:
             self._pending_ultra_fast_start_cancel()
 
+        # Clear references completely
         self._cancel_fast_update = None
         self._cancel_ultra_fast_update = None
         self._pending_fast_start_cancel = None
@@ -729,7 +778,7 @@ class SAJModbusHub(DataUpdateCoordinator[dict[str, Any]]):
 
     @asynccontextmanager
     async def _lock_order_guard(self, name: str):
-        """Track lock ordering to detect potential deadlocks."""
+        """Track lock ordering to detect potential deadlocks in nested paths."""
         stack = _LOCK_STACK.get()
         if stack:
             prev = stack[-1]
@@ -751,12 +800,17 @@ class SAJModbusHub(DataUpdateCoordinator[dict[str, Any]]):
     async def _write_register(
         self, address: int, value: int, *, allow_merge_locked: bool = False
     ) -> bool:
-        """Helper for charge_control.py to write via connection service."""
+        """
+        Helper for charge_control.py to write via connection service.
+
+        Uses dedicated write lock with priority over read operations.
+        """
         if not allow_merge_locked and address in self._merge_locks:
             raise ValueError(
                 f"Direct write to merge-locked register 0x{address:04x} is not allowed; use merge_write_register()."
             )
 
+        # Do not acquire the lock twice: try_write_registers already uses it.
         self._write_done.clear()
         try:
             async with self._lock_order_guard("write"):
@@ -776,7 +830,13 @@ class SAJModbusHub(DataUpdateCoordinator[dict[str, Any]]):
                 )
 
     async def _read_registers(self, address: int, count: int) -> list[int]:
-        """Helper for charge_control.py to read via connection service."""
+        """
+        Helper for charge_control.py to read via connection service.
+
+        Waits for any pending write operation before reading.
+        """
+        # Wait for any pending write operation – bounded to prevent infinite hang
+        # if _write_done is accidentally never set (defensive timeout).
         try:
             await asyncio.wait_for(self._write_done.wait(), timeout=15.0)
         except asyncio.TimeoutError:
@@ -812,6 +872,8 @@ class SAJModbusHub(DataUpdateCoordinator[dict[str, Any]]):
             if lock is None:
                 with self._rmw_dict_lock:
                     if address not in self._rmw_locks:
+                        # Hard LRU cap: always evict the oldest entry before adding a new one.
+                        # Should never exceed ~20 entries in normal operation.
                         if len(self._rmw_locks) >= 64:
                             evict_addr = None
                             for addr, lck in self._rmw_locks.items():
@@ -834,6 +896,7 @@ class SAJModbusHub(DataUpdateCoordinator[dict[str, Any]]):
                                     "Skipping eviction this time."
                                 )
                         self._rmw_locks[address] = asyncio.Lock()
+                    # Move to end so this entry is considered most-recently-used.
                     self._rmw_locks.move_to_end(address)
                     self._rmw_locks_last_access[address] = time.monotonic()
                 lock = self._rmw_locks[address]
